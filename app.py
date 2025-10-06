@@ -1394,7 +1394,7 @@ def main():
         <div style='text-align: center; color: #666; padding: 1rem;'>
             <p><b>Dashboard Nomadia</b> - Gestion et suivi des situations de stationnement</p>
             <p style='font-size: 0.8rem;'>Données synchronisées avec Airtable via API • Dernière actualisation: {}</p>
-            <p style='font-size: 0.7rem; color: #999;'>Ce dashboard respecte la dignité des personnes concernées</p>
+            <p style='font-size: 0.7rem; color: #999;'>Ce dashboard est la propriété de la société immatriculée au SIRET : 99158319600019</p>
         </div>
     """.format(datetime.now().strftime("%d/%m/%Y à %H:%M")), unsafe_allow_html=True)
 
