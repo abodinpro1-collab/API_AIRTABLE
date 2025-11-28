@@ -7,6 +7,13 @@ from datetime import datetime, timedelta
 import os
 import numpy as np
 from dotenv import load_dotenv
+from pdf_report_generator import (
+    NomadiaMonthlyReport,
+    MultiMonthReportGenerator,
+    generate_monthly_report_streamlit,
+    get_available_months,
+    validate_month
+)
 
 # Configuration de la page
 st.set_page_config(
@@ -229,6 +236,109 @@ def main():
             (df_filtered['Date_Debut'] <= pd.Timestamp(date_range[1]))
         ]
     
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### 📄 Rapports & Exports")
+        
+        # Onglet rapport
+        report_type = st.radio(
+            "Type de rapport",
+            ["Rapport Mensuel", "Comparaison Multi-mois"],
+            key="report_type"
+        )
+        
+        if report_type == "Rapport Mensuel":
+            # Sélection du mois
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                selected_month = st.selectbox(
+                    "Mois",
+                    range(1, 13),
+                    format_func=lambda x: ["Janvier", "Février", "Mars", "Avril", 
+                                        "Mai", "Juin", "Juillet", "Août",
+                                        "Septembre", "Octobre", "Novembre", "Décembre"][x-1]
+                )
+            
+            with col2:
+                selected_year = st.selectbox(
+                    "Année",
+                    range(2020, datetime.now().year + 1),
+                    index=datetime.now().year - 2020
+                )
+            
+            # Vérification et génération
+            if validate_month(selected_month, selected_year, df):
+                if st.button("📄 Générer le rapport", use_container_width=True, key="gen_report"):
+                    with st.spinner("Génération du rapport en cours..."):
+                        try:
+                            pdf_buffer = generate_monthly_report_streamlit(
+                                df, selected_month, selected_year
+                            )
+                            
+                            st.download_button(
+                                label="📥 Télécharger le PDF",
+                                data=pdf_buffer,
+                                file_name=f"rapport_nomadia_{selected_month:02d}_{selected_year}.pdf",
+                                mime="application/pdf",
+                                use_container_width=True,
+                                key="download_report"
+                            )
+                            st.success("✅ Rapport généré avec succès!")
+                            
+                        except Exception as e:
+                            st.error(f"❌ Erreur lors de la génération: {str(e)}")
+            else:
+                st.warning(f"⚠️ Aucune donnée pour {selected_month:02d}/{selected_year}")
+        
+        else:  # Comparaison multi-mois
+            st.markdown("**Sélectionner les mois à comparer**")
+            
+            available_months = get_available_months(df)
+            
+            # Afficher les mois disponibles
+            selected_months_list = []
+             
+            # Créer des cases à cocher pour chaque mois disponible
+            month_names = {
+                1: "Jan", 2: "Fév", 3: "Mar", 4: "Avr", 5: "Mai", 6: "Jun",
+                7: "Jul", 8: "Aoû", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Déc"
+            }
+            
+            for month, year in sorted(available_months, reverse=True)[:6]:  # 6 derniers mois
+                label = f"{month_names[month]} {year}"
+                if st.checkbox(label, key=f"month_{month}_{year}"):
+                    selected_months_list.append((month, year))
+            
+            if len(selected_months_list) >= 2:
+                if st.button("🔄 Générer la comparaison", use_container_width=True, 
+                            key="gen_comparison"):
+                    with st.spinner("Génération du rapport comparatif..."):
+                        try:
+                            multi_report = MultiMonthReportGenerator(
+                                df, selected_months_list
+                            )
+                            pdf_buffer = multi_report.generate_comparison_pdf()
+                            
+                            period_str = "_".join([f"{m[0]:02d}_{m[1]}" 
+                                                for m in selected_months_list])
+                            
+                            st.download_button(
+                                label="📥 Télécharger la comparaison",
+                                data=pdf_buffer,
+                                file_name=f"comparaison_nomadia_{period_str}.pdf",
+                                mime="application/pdf",
+                                use_container_width=True,
+                                key="download_comparison"
+                            )
+                            st.success("✅ Rapport comparatif généré!")
+                            
+                        except Exception as e:
+                            st.error(f"❌ Erreur: {str(e)}")
+            
+            elif len(selected_months_list) > 0:
+                st.info(f"ℹ️ Sélectionnez au moins 2 mois ({len(selected_months_list)}/2 actuellement)")
+
     # === ALERTES CRITIQUES ===
     st.markdown("### 📊 Activité Globale & Évolution")
     
