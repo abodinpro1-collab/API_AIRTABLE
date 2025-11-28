@@ -6,6 +6,9 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import os
 import numpy as np
+import json
+import hashlib
+from pathlib import Path
 from dotenv import load_dotenv
 from pdf_report_generator import (
     NomadiaMonthlyReport,
@@ -67,6 +70,22 @@ AIRTABLE_TOKEN = os.getenv('AIRTABLE_TOKEN')
 BASE_ID = 'app12d828OgebY9SU'
 TABLE_NAME = 'Signalements'
 
+# ============================================================================
+# 📁 CONFIGURATION CACHE (3 NIVEAUX)
+# ============================================================================
+
+# Dossier de cache local
+CACHE_DIR = Path('./.cache_nomadia')
+CACHE_DIR.mkdir(exist_ok=True)
+
+# Fichiers de cache
+CACHE_FILE_DATA = CACHE_DIR / 'airtable_data.json'
+CACHE_FILE_META = CACHE_DIR / 'cache_metadata.json'
+
+# TTL (Time To Live) en secondes
+TTL_MEMORY = 1800       # 30 minutes en mémoire Streamlit
+TTL_DISK = 86400        # 24 heures sur disque
+TTL_FORCE_REFRESH = 3600  # Forcer refresh après 1h
 
 # Headers pour les requêtes API
 headers = {
@@ -74,32 +93,146 @@ headers = {
     'Content-Type': 'application/json'
 }
 
-@st.cache_data(ttl=300)  # Cache pendant 5 minutes
-def fetch_airtable_data():
-    """Récupère les données depuis Airtable"""
+# ============================================================================
+# 📁 GESTION DU CACHE DISQUE
+# ============================================================================
+
+def get_cache_metadata():
+    """Lit les métadonnées du cache (timestamp, hash)"""
+    if CACHE_FILE_META.exists():
+        with open(CACHE_FILE_META, 'r') as f:
+            return json.load(f)
+    return {'timestamp': None, 'hash': None, 'record_count': 0}
+
+
+def save_cache_metadata(timestamp, data_hash, record_count):
+    """Sauvegarde les métadonnées du cache"""
+    metadata = {
+        'timestamp': timestamp.isoformat(),
+        'hash': data_hash,
+        'record_count': record_count
+    }
+    with open(CACHE_FILE_META, 'w') as f:
+        json.dump(metadata, f)
+
+
+def is_cache_expired(ttl_seconds):
+    """Vérifie si le cache disque a expiré"""
+    metadata = get_cache_metadata()
+    if not metadata.get('timestamp'):
+        return True
+
+    last_update = datetime.fromisoformat(metadata['timestamp'])
+    return datetime.now() - last_update > timedelta(seconds=ttl_seconds)
+
+
+def load_cache_from_disk():
+    """Charge les données depuis le cache disque"""
+    if CACHE_FILE_DATA.exists():
+        with open(CACHE_FILE_DATA, 'r') as f:
+            return json.load(f)
+    return []
+
+
+def save_cache_to_disk(records):
+    """Sauvegarde les données dans le cache disque"""
+    with open(CACHE_FILE_DATA, 'w') as f:
+        json.dump(records, f, indent=2, default=str)
+
+    # Calcul du hash pour vérifier les changements
+    data_str = json.dumps(records, sort_keys=True, default=str)
+    data_hash = hashlib.md5(data_str.encode()).hexdigest()
+
+    save_cache_metadata(datetime.now(), data_hash, len(records))
+
+
+def get_data_hash(records):
+    """Calcule le hash MD5 des données"""
+    data_str = json.dumps(records, sort_keys=True, default=str)
+    return hashlib.md5(data_str.encode()).hexdigest()
+
+
+# ============================================================================
+# 🌐 APPEL API AIRTABLE (OPTIMISÉ)
+# ============================================================================
+
+def fetch_airtable_data_from_api():
+    """Récupère les données directement depuis l'API Airtable"""
     url = f'https://api.airtable.com/v0/{BASE_ID}/{TABLE_NAME}'
-    
+
     all_records = []
     params = {}
-    
+    request_count = 0
+
     try:
         while True:
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
-            
+            request_count += 1
+
             all_records.extend(data.get('records', []))
-            
+
             # Pagination
             if 'offset' in data:
                 params['offset'] = data['offset']
             else:
                 break
-        
+
+        # Sauvegarde en cache disque pour la prochaine fois
+        save_cache_to_disk(all_records)
+
+        # Sauvegarde en cache Streamlit
+        st.session_state.airtable_data = all_records
+        st.session_state.airtable_timestamp = datetime.now()
+
+        st.session_state.api_requests = request_count
         return all_records
+
     except requests.exceptions.RequestException as e:
-        st.error(f"Erreur lors de la récupération des données: {e}")
-        return []
+        st.error(f"❌ Erreur API Airtable : {e}")
+        # Fallback sur le cache disque même expiré
+        try:
+            return load_cache_from_disk()
+        except:
+            return []
+
+
+def fetch_airtable_data_optimized():
+    """
+    Récupère les données depuis Airtable avec stratégie multi-niveaux :
+    1. Cache Streamlit (mémoire) → 30 min
+    2. Cache disque (persistent) → 24h
+    3. API Airtable → Fallback
+    """
+
+    # ✅ NIVEAU 1 : Cache Streamlit (mémoire)
+    if 'airtable_data' in st.session_state and 'airtable_timestamp' in st.session_state:
+        elapsed = (datetime.now() - st.session_state.airtable_timestamp).total_seconds()
+        if elapsed < TTL_MEMORY:
+            st.session_state.cache_source = "⚡ Mémoire (30min)"
+            return st.session_state.airtable_data
+
+    # ✅ NIVEAU 2 : Cache Disque (persistent)
+    if not is_cache_expired(TTL_DISK):
+        try:
+            cached_records = load_cache_from_disk()
+            st.session_state.airtable_data = cached_records
+            st.session_state.airtable_timestamp = datetime.now()
+            st.session_state.cache_source = "💾 Disque (24h)"
+            return cached_records
+        except Exception as e:
+            st.warning(f"⚠️ Erreur cache disque : {e}")
+
+    # ✅ NIVEAU 3 : API Airtable (dernière chance)
+    st.session_state.cache_source = "🌐 API Airtable (live)"
+    return fetch_airtable_data_from_api()
+
+
+# Wrapper pour compatibilité
+def fetch_airtable_data():
+    """Wrapper pour utiliser le nouveau système de cache"""
+    return fetch_airtable_data_optimized()
 
 def process_data(records):
     """Transforme les données Airtable en DataFrame"""
@@ -150,6 +283,59 @@ def process_data(records):
     
     return df
 
+# ============================================================================
+# 🎨 AFFICHAGE DU STATUT DU CACHE (Pour debug)
+# ============================================================================
+
+def display_cache_status():
+    """Affiche le statut du cache dans la sidebar"""
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### 🔄 Cache Status")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            source = getattr(st.session_state, 'cache_source', 'Inconnu')
+            st.markdown(f"**Source:** {source}")
+
+        with col2:
+            requests_count = getattr(st.session_state, 'api_requests', 0)
+            if requests_count > 0:
+                st.markdown(f"**Requêtes API:** {requests_count}")
+
+        # Bouton forcer refresh
+        if st.button("🔄 Forcer un refresh", use_container_width=True):
+            # Effacer le cache Streamlit
+            if 'airtable_data' in st.session_state:
+                del st.session_state.airtable_data
+            if 'airtable_timestamp' in st.session_state:
+                del st.session_state.airtable_timestamp
+
+            # Effacer le cache disque
+            try:
+                CACHE_FILE_DATA.unlink()
+                CACHE_FILE_META.unlink()
+            except:
+                pass
+
+            st.rerun()
+
+        # Métadonnées du cache
+        metadata = get_cache_metadata()
+        if metadata.get('timestamp'):
+            last_update = datetime.fromisoformat(metadata['timestamp'])
+            time_ago = datetime.now() - last_update
+
+            st.markdown(f"""
+            <div style='font-size: 0.75rem; color: #666; margin-top: 1rem;'>
+            <p><b>Dernière mise à jour:</b><br/>{last_update.strftime('%d/%m/%Y %H:%M')}</p>
+            <p><b>Il y a:</b> {int(time_ago.total_seconds() // 60)} min</p>
+            <p><b>Enregistrements:</b> {metadata.get('record_count', 0)}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+
 def calculate_priority_score(row):
     """Calcule un score de priorité pour chaque signalement"""
     if row['Nb_Interventions'] == 0:
@@ -171,15 +357,11 @@ def main():
     with st.sidebar:
         st.image("https://via.placeholder.com/150x50/1f77b4/ffffff?text=Nomadia", use_container_width=True)
         st.markdown("---")
-        
-        # Bouton de rafraîchissement
-        if st.button("🔄 Actualiser les données", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-        
-        st.markdown("---")
         st.markdown("### 📋 Filtres")
     
+    # Afficher le statut du cache
+    display_cache_status()
+
     # Chargement des données
     with st.spinner("Chargement des données..."):
         records = fetch_airtable_data()
